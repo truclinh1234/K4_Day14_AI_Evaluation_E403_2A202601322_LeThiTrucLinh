@@ -25,10 +25,11 @@ from openai import OpenAI, OpenAIError
 
 try:
     import google.generativeai as genai
-    from google.api_core.exceptions import GoogleAPIError
+    from google.api_core.exceptions import GoogleAPIError, ResourceExhausted
 except ImportError:  # pragma: no cover - optional dependency
     genai = None
     GoogleAPIError = Exception
+    ResourceExhausted = Exception
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -274,6 +275,12 @@ class OpenAIGenerator:
 
 
 class GeminiGenerator:
+    # Free-tier Gemini keys are throttled to a few requests per minute, so
+    # this generator paces calls and retries once on a 429 before giving up.
+    MIN_CALL_INTERVAL_SECONDS = 13.0
+    MAX_RETRIES = 4
+    RETRY_BACKOFF_SECONDS = 30.0
+
     def __init__(self, max_output_tokens: int = 300) -> None:
         if genai is None:
             raise RuntimeError(
@@ -287,17 +294,37 @@ class GeminiGenerator:
         if not self.model_name:
             raise RuntimeError("GEMINI_MODEL is missing from .env")
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(self.model_name)
+        self._client = genai.GenerativeModel(self.model_name)
+        self.model = self.model_name
         self.max_output_tokens = max_output_tokens
+        self._last_call_at: float | None = None
+
+    def _throttle(self) -> None:
+        if self._last_call_at is None:
+            return
+        elapsed = time.monotonic() - self._last_call_at
+        remaining = self.MIN_CALL_INTERVAL_SECONDS - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
     def generate(self, prompt: str) -> str:
-        response = self.model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0,
-                max_output_tokens=self.max_output_tokens,
-            ),
-        )
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            self._throttle()
+            self._last_call_at = time.monotonic()
+            try:
+                response = self._client.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0,
+                        max_output_tokens=self.max_output_tokens,
+                    ),
+                )
+                break
+            except ResourceExhausted:
+                if attempt == self.MAX_RETRIES:
+                    raise
+                time.sleep(self.RETRY_BACKOFF_SECONDS * attempt)
+
         answer = (response.text or "").strip()
         if not answer:
             raise RuntimeError("Gemini returned an empty answer")
