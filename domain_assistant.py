@@ -23,6 +23,13 @@ from typing import Any, Protocol
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 
+try:
+    import google.generativeai as genai
+    from google.api_core.exceptions import GoogleAPIError
+except ImportError:  # pragma: no cover - optional dependency
+    genai = None
+    GoogleAPIError = Exception
+
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -266,6 +273,48 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        if genai is None:
+            raise RuntimeError(
+                "google-generativeai is not installed; "
+                "run: pip install -r requirements.txt"
+            )
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model_name = os.getenv("GEMINI_MODEL", "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model_name:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel(self.model_name)
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        response = self.model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0,
+                max_output_tokens=self.max_output_tokens,
+            ),
+        )
+        answer = (response.text or "").strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
+def _default_generator() -> TextGenerator:
+    provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+    if provider == "gemini":
+        return GeminiGenerator()
+    if provider == "openai":
+        return OpenAIGenerator()
+    raise RuntimeError(
+        f"Unknown LLM_PROVIDER {provider!r}; use 'openai' or 'gemini'"
+    )
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +348,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else _default_generator(),
             top_k,
         )
 
@@ -508,7 +557,7 @@ def main() -> int:
             json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-    except (OSError, OpenAIError, TypeError, ValueError, RuntimeError) as exc:
+    except (OSError, OpenAIError, GoogleAPIError, TypeError, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}")
         return 2
     print(f"Generated {len(artifact['answers'])} actual answers: {output}")
